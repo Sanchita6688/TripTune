@@ -155,23 +155,17 @@ router.delete(['/:songId', '/:tripId/:songId'], async (req, res) => {
       return res.status(403).json({ success: false, message: 'Not authorized to remove this song' });
     }
 
-    song.status = 'REMOVED';
-    await song.save();
-
-    const targetTripId = tripId || song.tripId;
-    await queueService.updateSongPositions(targetTripId);
-    const queueState = await queueService.getQueueState(targetTripId);
-    const tripState = await queueService.commitTripMutation(targetTripId);
+    const result = await queueService.removeSong(tripId, songId);
 
     const io = getIO(req);
     if (io) {
-      broadcastTripState(io, tripState);
+      if (result.changed) broadcastTripState(io, result.tripState);
     }
 
     return res.status(200).json({
       success: true,
-      message: 'Song removed from queue',
-      data: { ...queueState, tripState }
+      message: result.changed ? 'Song removed from queue' : 'Song was already removed or handled',
+      data: result.tripState
     });
   } catch (error) {
     console.error('Remove song error:', error);

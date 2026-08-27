@@ -11,14 +11,45 @@ class TripSocketHandler {
     this.queueService = new QueueService();
   }
 
-  async getTripUser(tripId, userId, requireHost = false) {
-    if (!mongoose.Types.ObjectId.isValid(tripId) || !mongoose.Types.ObjectId.isValid(userId)) {
+  async authorizeSocketMutation(socket, data, { requireHost = false } = {}) {
+    const tripId = socket.data?.tripId;
+    const userId = socket.data?.userId;
+    const sessionId = socket.data?.sessionId;
+
+    if (!mongoose.Types.ObjectId.isValid(tripId) || !mongoose.Types.ObjectId.isValid(userId) || !sessionId) {
       return null;
     }
-    const user = await User.findById(userId);
-    if (!user || !user.isActive || user.tripId.toString() !== tripId.toString()) return null;
-    if (requireHost && user.role !== 'HOST') return null;
-    return user;
+    if (data?.tripId !== tripId || data?.userId !== userId) return null;
+
+    const user = await User.findOne({
+      _id: userId,
+      tripId,
+      sessionId,
+      isActive: true
+    });
+    const trip = await Trip.findById(tripId);
+    if (!user || !trip || trip.status === 'ENDED' || (trip.expiresAt && trip.expiresAt <= new Date())) {
+      return null;
+    }
+    if (requireHost && (user.role !== 'HOST' || trip.hostId !== user._id.toString())) {
+      return null;
+    }
+
+    return { tripId, userId, user, trip };
+  }
+
+  async cleanupDisconnectedSocket(tripId, userId, socketId) {
+    const user = await User.findOneAndUpdate(
+      { _id: userId, tripId, socketId, isActive: true },
+      { isActive: false, socketId: null, lastSeenAt: new Date() },
+      { new: true }
+    );
+
+    if (!user) return false;
+
+    const tripState = await this.queueService.commitTripMutation(tripId);
+    broadcastTripState(this.io, tripState);
+    return true;
   }
 
   handleConnection(socket) {
@@ -95,15 +126,16 @@ class TripSocketHandler {
     // Add song via Socket
     socket.on('addSong', async (data) => {
       try {
-        const { tripId, userId, videoData } = data || {};
-        const roomName = `trip:${tripId}`;
+        const { videoData } = data || {};
+        const authorization = await this.authorizeSocketMutation(socket, data);
 
-        if (!tripId || !userId || !videoData || !videoData.videoId || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        if (!authorization || !videoData || !videoData.videoId) {
           socket.emit('error', { message: 'Invalid song parameters' });
           return;
         }
 
-        const result = await this.queueService.addSong(tripId, userId, videoData);
+        const result = await this.queueService.addSong(authorization.tripId, authorization.userId, videoData);
+        const roomName = `trip:${authorization.tripId}`;
 
         // Broadcast updated queue state to room
         broadcastTripState(this.io, result.tripState);
@@ -123,14 +155,13 @@ class TripSocketHandler {
     // Skip song (Host only)
     socket.on('skipSong', async (data) => {
       try {
-        const { tripId, userId } = data || {};
-        const roomName = `trip:${tripId}`;
-
-        const user = await this.getTripUser(tripId, userId, true);
-        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        const authorization = await this.authorizeSocketMutation(socket, data, { requireHost: true });
+        if (!authorization) {
           socket.emit('error', { message: 'Only the host can skip songs' });
           return;
         }
+        const { tripId } = authorization;
+        const roomName = `trip:${tripId}`;
 
         const currentSong = await Song.findOne({ tripId, status: 'PLAYING' }).select('_id');
         const transition = await this.queueService.transitionCurrentSong(tripId, currentSong?._id, 'SKIPPED');
@@ -155,14 +186,14 @@ class TripSocketHandler {
     // Song ended naturally (from player)
     socket.on('songEnded', async (data) => {
       try {
-        const { tripId, songId, userId } = data || {};
-        const roomName = `trip:${tripId}`;
-
-        const user = await this.getTripUser(tripId, userId, true);
-        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        const authorization = await this.authorizeSocketMutation(socket, data, { requireHost: true });
+        if (!authorization) {
           socket.emit('error', { message: 'Only the host can advance songs' });
           return;
         }
+        const { tripId } = authorization;
+        const { songId } = data || {};
+        const roomName = `trip:${tripId}`;
 
         const transition = await this.queueService.transitionCurrentSong(tripId, songId, 'PLAYED');
         if (!transition.claimed) return;
@@ -185,14 +216,13 @@ class TripSocketHandler {
     // Play song (Host only)
     socket.on('playSong', async (data) => {
       try {
-        const { tripId, userId } = data || {};
-        const roomName = `trip:${tripId}`;
-
-        const user = await this.getTripUser(tripId, userId, true);
-        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        const authorization = await this.authorizeSocketMutation(socket, data, { requireHost: true });
+        if (!authorization) {
           socket.emit('error', { message: 'Only host can control playback' });
           return;
         }
+        const { tripId } = authorization;
+        const roomName = `trip:${tripId}`;
 
         await Trip.findByIdAndUpdate(tripId, { isPlaying: true });
 
@@ -207,14 +237,13 @@ class TripSocketHandler {
     // Pause song (Host only)
     socket.on('pauseSong', async (data) => {
       try {
-        const { tripId, userId } = data || {};
-        const roomName = `trip:${tripId}`;
-
-        const user = await this.getTripUser(tripId, userId, true);
-        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        const authorization = await this.authorizeSocketMutation(socket, data, { requireHost: true });
+        if (!authorization) {
           socket.emit('error', { message: 'Only host can control playback' });
           return;
         }
+        const { tripId } = authorization;
+        const roomName = `trip:${tripId}`;
 
         await Trip.findByIdAndUpdate(tripId, { isPlaying: false });
 
@@ -229,14 +258,13 @@ class TripSocketHandler {
     // Lock / Unlock queue (Host only)
     socket.on('lockQueue', async (data) => {
       try {
-        const { tripId, userId } = data || {};
-        const roomName = `trip:${tripId}`;
-
-        const user = await this.getTripUser(tripId, userId, true);
-        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        const authorization = await this.authorizeSocketMutation(socket, data, { requireHost: true });
+        if (!authorization) {
           socket.emit('error', { message: 'Only host can lock/unlock queue' });
           return;
         }
+        const { tripId } = authorization;
+        const roomName = `trip:${tripId}`;
 
         const trip = await Trip.findById(tripId);
         if (trip) {
@@ -253,14 +281,13 @@ class TripSocketHandler {
     // End Trip (Host only) - Deletes Trip, Users, and Songs from database
     socket.on('endTrip', async (data) => {
       try {
-        const { tripId, userId } = data || {};
-        const roomName = `trip:${tripId}`;
-
-        const user = await this.getTripUser(tripId, userId, true);
-        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        const authorization = await this.authorizeSocketMutation(socket, data, { requireHost: true });
+        if (!authorization) {
           socket.emit('error', { message: 'Only host can end the trip' });
           return;
         }
+        const { tripId } = authorization;
+        const roomName = `trip:${tripId}`;
 
         // Delete from database permanently
         await Trip.findByIdAndDelete(tripId);
@@ -278,13 +305,17 @@ class TripSocketHandler {
     // Remove song
     socket.on('removeSong', async (data) => {
       try {
-        const { tripId, songId, userId } = data || {};
+        const authorization = await this.authorizeSocketMutation(socket, data);
+        const { songId } = data || {};
+        if (!authorization) {
+          socket.emit('error', { message: 'Song or user not found' });
+          return;
+        }
+        const { tripId, userId, user } = authorization;
         const roomName = `trip:${tripId}`;
-
-        const user = await this.getTripUser(tripId, userId);
         const song = await Song.findOne({ _id: songId, tripId });
 
-        if (!user || !song || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+        if (!song) {
           socket.emit('error', { message: 'Song or user not found' });
           return;
         }
@@ -294,14 +325,8 @@ class TripSocketHandler {
           return;
         }
 
-        song.status = 'REMOVED';
-        await song.save();
-
-        await this.queueService.updateSongPositions(tripId);
-        const queueState = await this.queueService.getQueueState(tripId);
-
-        const tripState = await this.queueService.commitTripMutation(tripId);
-        broadcastTripState(this.io, tripState);
+        const result = await this.queueService.removeSong(tripId, songId);
+        if (result.changed) broadcastTripState(this.io, result.tripState);
 
       } catch (error) {
         console.error('removeSong socket error:', error);
@@ -310,9 +335,9 @@ class TripSocketHandler {
 
     socket.on('leaveTrip', async (data) => {
       try {
-        const { tripId, userId } = data || {};
-        const user = await this.getTripUser(tripId, userId);
-        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) return;
+        const authorization = await this.authorizeSocketMutation(socket, data);
+        if (!authorization) return;
+        const { tripId, userId, user } = authorization;
 
         user.isActive = false;
         user.socketId = null;
@@ -333,14 +358,12 @@ class TripSocketHandler {
       try {
         const { tripId, userId, roomName } = socket.data || {};
         if (tripId && userId) {
-          await User.findByIdAndUpdate(userId, {
-            lastSeenAt: new Date(),
-            socketId: null
-          });
-
           setTimeout(async () => {
-            const members = await User.find({ tripId, isActive: true }).select('displayName role songsPlayed joinedAt');
-            this.io.to(roomName).emit('memberLeft', { userId, members });
+            try {
+              await this.cleanupDisconnectedSocket(tripId, userId, socket.id);
+            } catch (error) {
+              console.error('Delayed disconnect cleanup error:', error);
+            }
           }, 15000);
         }
       } catch (error) {

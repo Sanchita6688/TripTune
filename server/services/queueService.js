@@ -277,6 +277,73 @@ class QueueService {
     return result.claimed ? result.nextSong : null;
   }
 
+  async removeSong(tripId, songId) {
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      await session.withTransaction(async () => {
+        const trip = await Trip.findOneAndUpdate(
+          { _id: tripId },
+          { $inc: { queueMutationVersion: 0 } },
+          { new: true, session }
+        );
+        if (!trip) throw { status: 404, message: 'Trip not found' };
+
+        const playingSong = await Song.findOneAndUpdate(
+          { _id: songId, tripId, status: 'PLAYING' },
+          { status: 'REMOVED', finishedAt: new Date() },
+          { new: true, session }
+        );
+
+        let removedSong = playingSong;
+        let nextSong = null;
+        if (playingSong) {
+          nextSong = await this.getNextSong(tripId, session);
+          if (!nextSong) {
+            await Trip.findOneAndUpdate(
+              { _id: tripId },
+              { currentSongId: null, isPlaying: false },
+              { new: true, session }
+            );
+          }
+        } else {
+          removedSong = await Song.findOneAndUpdate(
+            { _id: songId, tripId, status: 'QUEUED' },
+            { status: 'REMOVED', finishedAt: new Date() },
+            { new: true, session }
+          );
+        }
+
+        if (!removedSong) {
+          result = {
+            changed: false,
+            alreadyHandled: true,
+            tripState: await this.getCanonicalTripState(tripId, session)
+          };
+          return;
+        }
+
+        await this.updateSongPositions(tripId, session);
+        await Trip.findOneAndUpdate(
+          { _id: tripId },
+          { $inc: { queueMutationVersion: 1 } },
+          { new: true, session }
+        );
+
+        result = {
+          changed: true,
+          alreadyHandled: false,
+          removedSong,
+          nextSong,
+          tripState: await this.getCanonicalTripState(tripId, session)
+        };
+      });
+      return result;
+    } finally {
+      await session.endSession();
+    }
+  }
+
   async updateSongPositions(tripId, session = null) {
     try {
       let queuedQuery = Song.find({
