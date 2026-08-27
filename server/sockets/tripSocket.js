@@ -3,6 +3,7 @@ const Trip = require('../models/Trip');
 const User = require('../models/User');
 const Song = require('../models/Song');
 const QueueService = require('../services/queueService');
+const broadcastTripState = require('../utils/tripState');
 
 class TripSocketHandler {
   constructor(io) {
@@ -71,20 +72,11 @@ class TripSocketHandler {
         user.isActive = true;
         await user.save();
 
-        const queueState = await this.queueService.getQueueState(tripId);
+        const tripState = await this.queueService.getCanonicalTripState(tripId);
         const members = await User.find({ tripId, isActive: true }).select('displayName role songsPlayed joinedAt');
 
         // Emit state to joined client
-        socket.emit('tripState', {
-          trip,
-          currentSong: queueState.currentSong,
-          queue: queueState.queue,
-          playedHistory: queueState.playedHistory,
-          members,
-          queueLocked: trip ? trip.queueLocked : false,
-          isPlaying: trip ? trip.isPlaying : false,
-          status: trip ? trip.status : 'WAITING'
-        });
+        socket.emit('tripState', tripState);
 
         // Broadcast to other members in room
         socket.to(roomName).emit('memberJoined', {
@@ -114,15 +106,12 @@ class TripSocketHandler {
         const result = await this.queueService.addSong(tripId, userId, videoData);
 
         // Broadcast updated queue state to room
-        this.io.to(roomName).emit('queueUpdated', result.queueState);
+        broadcastTripState(this.io, result.tripState);
         this.io.to(roomName).emit('songAdded', {
           song: result.song,
           isDuplicate: result.isDuplicate,
-          message: result.message
-        });
-        this.io.to(roomName).emit('playbackStateChanged', {
-          isPlaying: Boolean(result.queueState.currentSong),
-          currentSong: result.queueState.currentSong
+          message: result.message,
+          tripState: result.tripState
         });
 
       } catch (error) {
@@ -154,8 +143,8 @@ class TripSocketHandler {
           isPlaying: !!nextSong
         });
 
-        this.io.to(roomName).emit('queueUpdated', queueState);
-        this.io.to(roomName).emit('playbackStateChanged', { isPlaying: !!nextSong, currentSong: nextSong });
+        const tripState = await this.queueService.commitTripMutation(tripId);
+        broadcastTripState(this.io, tripState);
 
       } catch (error) {
         console.error('skipSong socket error:', error);
@@ -185,8 +174,8 @@ class TripSocketHandler {
           isPlaying: !!nextSong
         });
 
-        this.io.to(roomName).emit('queueUpdated', queueState);
-        this.io.to(roomName).emit('playbackStateChanged', { isPlaying: !!nextSong, currentSong: nextSong });
+        const tripState = await this.queueService.commitTripMutation(tripId);
+        broadcastTripState(this.io, tripState);
 
       } catch (error) {
         console.error('songEnded socket error:', error);
@@ -207,7 +196,8 @@ class TripSocketHandler {
 
         await Trip.findByIdAndUpdate(tripId, { isPlaying: true });
 
-        this.io.to(roomName).emit('playbackStateChanged', { isPlaying: true });
+        const tripState = await this.queueService.commitTripMutation(tripId);
+        broadcastTripState(this.io, tripState);
 
       } catch (error) {
         console.error('playSong socket error:', error);
@@ -228,7 +218,8 @@ class TripSocketHandler {
 
         await Trip.findByIdAndUpdate(tripId, { isPlaying: false });
 
-        this.io.to(roomName).emit('playbackStateChanged', { isPlaying: false });
+        const tripState = await this.queueService.commitTripMutation(tripId);
+        broadcastTripState(this.io, tripState);
 
       } catch (error) {
         console.error('pauseSong socket error:', error);
@@ -251,7 +242,8 @@ class TripSocketHandler {
         if (trip) {
           trip.queueLocked = !trip.queueLocked;
           await trip.save();
-          this.io.to(roomName).emit('queueLocked', { queueLocked: trip.queueLocked });
+          const tripState = await this.queueService.commitTripMutation(tripId);
+          broadcastTripState(this.io, tripState);
         }
       } catch (error) {
         console.error('lockQueue socket error:', error);
@@ -308,7 +300,8 @@ class TripSocketHandler {
         await this.queueService.updateSongPositions(tripId);
         const queueState = await this.queueService.getQueueState(tripId);
 
-        this.io.to(roomName).emit('queueUpdated', queueState);
+        const tripState = await this.queueService.commitTripMutation(tripId);
+        broadcastTripState(this.io, tripState);
 
       } catch (error) {
         console.error('removeSong socket error:', error);
@@ -327,8 +320,9 @@ class TripSocketHandler {
         await user.save();
         socket.leave(`trip:${tripId}`);
 
-        const members = await User.find({ tripId, isActive: true }).select('displayName role songsPlayed joinedAt');
-        this.io.to(`trip:${tripId}`).emit('memberLeft', { userId, members });
+        const tripState = await this.queueService.commitTripMutation(tripId);
+        broadcastTripState(this.io, tripState);
+        this.io.to(`trip:${tripId}`).emit('memberLeft', { userId, members: tripState.members });
       } catch (error) {
         console.error('leaveTrip socket error:', error);
       }

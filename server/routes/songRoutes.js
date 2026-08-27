@@ -5,6 +5,7 @@ const Song = require('../models/Song');
 const Trip = require('../models/Trip');
 const User = require('../models/User');
 const QueueService = require('../services/queueService');
+const broadcastTripState = require('../utils/tripState');
 
 const queueService = new QueueService();
 
@@ -63,15 +64,12 @@ router.post(['/', '/:tripId'], async (req, res) => {
     // Broadcast real-time queue update via Socket.IO
     const io = getIO(req);
     if (io) {
-      io.to(`trip:${tripId}`).emit('queueUpdated', result.queueState);
+      broadcastTripState(io, result.tripState);
       io.to(`trip:${tripId}`).emit('songAdded', {
         song: result.song,
         isDuplicate: result.isDuplicate,
-        queueState: result.queueState
-      });
-      io.to(`trip:${tripId}`).emit('playbackStateChanged', {
-        isPlaying: Boolean(result.queueState.currentSong),
-        currentSong: result.queueState.currentSong
+        queueState: result.queueState,
+        tripState: result.tripState
       });
     }
 
@@ -98,10 +96,10 @@ router.get(['/', '/:tripId'], async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid Trip ID' });
     }
 
-    const queueState = await queueService.getQueueState(tripId);
+    const tripState = await queueService.getCanonicalTripState(tripId);
     return res.status(200).json({
       success: true,
-      data: queueState
+      data: tripState
     });
   } catch (error) {
     console.error('Get queue error:', error);
@@ -163,16 +161,17 @@ router.delete(['/:songId', '/:tripId/:songId'], async (req, res) => {
     const targetTripId = tripId || song.tripId;
     await queueService.updateSongPositions(targetTripId);
     const queueState = await queueService.getQueueState(targetTripId);
+    const tripState = await queueService.commitTripMutation(targetTripId);
 
     const io = getIO(req);
     if (io) {
-      io.to(`trip:${targetTripId}`).emit('queueUpdated', queueState);
+      broadcastTripState(io, tripState);
     }
 
     return res.status(200).json({
       success: true,
       message: 'Song removed from queue',
-      data: queueState
+      data: { ...queueState, tripState }
     });
   } catch (error) {
     console.error('Remove song error:', error);
@@ -200,7 +199,7 @@ router.post(['/skip', '/:tripId/skip'], async (req, res) => {
         success: true,
         alreadyHandled: true,
         message: 'The current song was already handled',
-        data: { currentSong: queueState.currentSong, queueState }
+        data: { currentSong: queueState.currentSong, queueState, tripState: await queueService.getCanonicalTripState(tripId) }
       });
     }
     const nextSong = transition.nextSong;
@@ -210,17 +209,17 @@ router.post(['/skip', '/:tripId/skip'], async (req, res) => {
       currentSongId: nextSong ? nextSong._id : null,
       isPlaying: !!nextSong
     });
+    const tripState = await queueService.commitTripMutation(tripId);
 
     const io = getIO(req);
     if (io) {
-      io.to(`trip:${tripId}`).emit('queueUpdated', queueState);
-      io.to(`trip:${tripId}`).emit('playbackStateChanged', { isPlaying: !!nextSong, currentSong: nextSong });
+      broadcastTripState(io, tripState);
     }
 
     return res.status(200).json({
       success: true,
       message: nextSong ? 'Skipped to next song' : 'Queue is now empty',
-      data: { currentSong: nextSong, queueState }
+      data: { currentSong: nextSong, queueState, tripState }
     });
   } catch (error) {
     console.error('Skip song error:', error);
@@ -248,7 +247,7 @@ router.post(['/ended', '/:tripId/ended'], async (req, res) => {
         success: true,
         alreadyHandled: true,
         message: 'That song was already handled',
-        data: { currentSong: queueState.currentSong, queueState }
+        data: { currentSong: queueState.currentSong, queueState, tripState: await queueService.getCanonicalTripState(tripId) }
       });
     }
     const nextSong = transition.nextSong;
@@ -258,19 +257,16 @@ router.post(['/ended', '/:tripId/ended'], async (req, res) => {
       currentSongId: nextSong ? nextSong._id : null,
       isPlaying: !!nextSong
     });
+    const tripState = await queueService.commitTripMutation(tripId);
 
     const io = getIO(req);
     if (io) {
-      io.to(`trip:${tripId}`).emit('queueUpdated', queueState);
-      io.to(`trip:${tripId}`).emit('playbackStateChanged', {
-        isPlaying: Boolean(nextSong),
-        currentSong: nextSong
-      });
+      broadcastTripState(io, tripState);
     }
 
     return res.status(200).json({
       success: true,
-      data: { currentSong: nextSong, queueState }
+      data: { currentSong: nextSong, queueState, tripState }
     });
   } catch (error) {
     console.error('Song ended handler error:', error);

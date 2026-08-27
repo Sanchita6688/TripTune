@@ -73,6 +73,22 @@ function App() {
   const [actionLoading, setActionLoading] = useState(false)
   const [notification, setNotification] = useState(null)
   const socketStateReceivedRef = useRef(false)
+  const stateVersionRef = useRef(-1)
+
+  const applyTripState = (state) => {
+    if (!state) return false
+    const version = Number(state.version)
+    if (!Number.isFinite(version) || version < stateVersionRef.current) return false
+
+    stateVersionRef.current = version
+    if (state.trip) saveTripSession(state.trip)
+    if (state.currentSong !== undefined) setCurrentSong(state.currentSong)
+    if (state.queue) setQueue(state.queue)
+    if (state.members) setMembers(state.members)
+    if (state.queueLocked !== undefined) setQueueLocked(state.queueLocked)
+    if (state.isPlaying !== undefined) setIsPlaying(state.isPlaying)
+    return true
+  }
 
   // Helper session savers
   const saveTripSession = (trip) => {
@@ -124,12 +140,7 @@ function App() {
       const res = await api.get(`/trips/${tripId}`)
       if (res.data) {
         if (socketStateReceivedRef.current) return
-        if (res.data.trip) saveTripSession(res.data.trip)
-        if (res.data.currentSong !== undefined) setCurrentSong(res.data.currentSong)
-        if (res.data.queue) setQueue(res.data.queue)
-        if (res.data.members) setMembers(res.data.members)
-        if (res.data.queueLocked !== undefined) setQueueLocked(res.data.queueLocked)
-        if (res.data.trip?.isPlaying !== undefined) setIsPlaying(res.data.trip.isPlaying)
+        applyTripState(res.data.tripState || res.data)
       }
     } catch (err) {
       console.error('Fetch trip details error:', err)
@@ -151,6 +162,7 @@ function App() {
 
     const socket = getSocket()
     socketStateReceivedRef.current = false
+    stateVersionRef.current = -1
 
     const joinRoom = () => {
       socket.emit('joinTrip', {
@@ -165,27 +177,19 @@ function App() {
     if (socket.connected) joinRoom()
 
     const handleTripState = (state) => {
-      socketStateReceivedRef.current = true
-      if (state.trip) saveTripSession(state.trip)
-      if (state.currentSong !== undefined) setCurrentSong(state.currentSong)
-      if (state.queue) setQueue(state.queue)
-      if (state.members) setMembers(state.members)
-      if (state.queueLocked !== undefined) setQueueLocked(state.queueLocked)
-      if (state.isPlaying !== undefined) setIsPlaying(state.isPlaying)
+      socketStateReceivedRef.current = applyTripState(state) || socketStateReceivedRef.current
     }
 
     const handleQueueUpdated = (state) => {
-      if (state.currentSong !== undefined) setCurrentSong(state.currentSong)
-      if (state.queue) setQueue(state.queue)
+      if (state.message) showNotification(state.message)
     }
 
     const handlePlaybackStateChanged = (data) => {
-      if (data.isPlaying !== undefined) setIsPlaying(data.isPlaying)
-      if (data.currentSong !== undefined) setCurrentSong(data.currentSong)
+      if (data.message) showNotification(data.message)
     }
 
     const handleQueueLocked = (data) => {
-      if (data.queueLocked !== undefined) setQueueLocked(data.queueLocked)
+      if (data.message) showNotification(data.message)
     }
 
     const handleSongAdded = (data) => {
@@ -193,12 +197,11 @@ function App() {
     }
 
     const handleMemberJoined = (data) => {
-      if (data.members) setMembers(data.members)
       if (data.displayName) showNotification(`RIDER ${data.displayName.toUpperCase()} BOARDED THE BUS`)
     }
 
     const handleMemberLeft = (data) => {
-      if (data.members) setMembers(data.members)
+      if (data.message) showNotification(data.message)
     }
 
     const handleTripEnded = () => {
@@ -272,9 +275,7 @@ function App() {
       const res = await api.post('/trips/join', { joinCode, displayName: passengerName })
       saveTripSession(res.data.trip)
       saveUserSession(res.data.user)
-      if (res.data.currentSong !== undefined) setCurrentSong(res.data.currentSong)
-      if (res.data.queue) setQueue(res.data.queue)
-      if (res.data.queueLocked !== undefined) setQueueLocked(res.data.queueLocked)
+      applyTripState(res.data.tripState || res.data)
       setMode('trip')
     } catch (err) {
       setActionError(err.response?.data?.message || 'Invalid join code or failed to board')

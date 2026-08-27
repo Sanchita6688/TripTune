@@ -25,6 +25,7 @@ jest.mock('../models/User', () => ({
 }));
 
 jest.mock('../models/Trip', () => ({
+  findById: jest.fn().mockResolvedValue({ _id: 'trip-1', queueMutationVersion: 1 }),
   findOneAndUpdate: jest.fn(),
   findByIdAndUpdate: jest.fn()
 }));
@@ -41,6 +42,9 @@ describe('Concurrent song addition safeguards', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    Song.findOne.mockReturnValue(query(null));
+    Song.find.mockReturnValue(query([]));
+    User.find.mockReturnValue(query([]));
     session = {
       withTransaction: jest.fn(async callback => callback()),
       endSession: jest.fn().mockResolvedValue()

@@ -16,6 +16,7 @@ class QueueService {
       await session.withTransaction(async () => {
         result = await this.addSongInTransaction(tripId, userId, videoData, session);
       });
+      result.tripState = await this.getCanonicalTripState(tripId);
       return result;
     } catch (error) {
       if (error?.code === 11000) {
@@ -40,30 +41,31 @@ class QueueService {
     }
 
     const currentNames = existingSong.userDisplayName ? existingSong.userDisplayName.split(', ') : [];
-    if (!currentNames.includes(user.displayName)) {
+    const requesterAdded = !currentNames.includes(user.displayName);
+    if (requesterAdded) {
       currentNames.push(user.displayName);
       await Song.findByIdAndUpdate(existingSong._id, {
         userDisplayName: currentNames.join(', ')
       });
     }
 
+    const tripState = requesterAdded
+      ? await this.commitTripMutation(tripId)
+      : await this.getCanonicalTripState(tripId);
+
     return {
       song: await Song.findById(existingSong._id),
       isDuplicate: true,
       message: `Song is already in queue! Added ${user.displayName} to requesters.`,
-      queueState: await this.getQueueState(tripId)
+      queueState: await this.getQueueState(tripId),
+      tripState
     };
   }
 
   async addSongInTransaction(tripId, userId, videoData, session) {
     // 1. Verify trip exists and is active
     // Writing the trip document serializes additions for the same trip.
-    const tripLock = await Trip.findOneAndUpdate(
-      { _id: tripId },
-      { $inc: { queueMutationVersion: 1 } },
-      { new: true, session }
-    );
-    const trip = tripLock;
+    const trip = await Trip.findById(tripId).session(session);
     if (!trip) {
       throw { status: 404, message: 'Trip not found' };
     }
@@ -75,11 +77,7 @@ class QueueService {
     }
 
     // 2. Verify user belongs to trip
-    const user = await User.findOneAndUpdate(
-      { _id: userId, tripId },
-      { $inc: { queueMutationVersion: 1 } },
-      { new: true, session }
-    );
+    const user = await User.findOne({ _id: userId, tripId }).session(session);
     if (!user || user.tripId.toString() !== tripId.toString()) {
       throw { status: 403, message: 'User does not belong to this trip' };
     }
@@ -108,11 +106,17 @@ class QueueService {
 
     if (existingSong) {
       const currentNames = existingSong.userDisplayName ? existingSong.userDisplayName.split(', ') : [];
-      if (!currentNames.includes(user.displayName)) {
+      const requesterAdded = !currentNames.includes(user.displayName);
+      if (requesterAdded) {
         currentNames.push(user.displayName);
         await Song.findByIdAndUpdate(existingSong._id, {
           userDisplayName: currentNames.join(', ')
         }, { session });
+        await Trip.findOneAndUpdate(
+          { _id: tripId },
+          { $inc: { queueMutationVersion: 1 } },
+          { new: true, session }
+        );
       }
       const updatedExisting = await Song.findById(existingSong._id).session(session);
       const queueState = await this.getQueueState(tripId, session);
@@ -154,6 +158,12 @@ class QueueService {
     if (!currentPlaying) {
       await this.getNextSong(tripId, session);
     }
+
+    await Trip.findOneAndUpdate(
+      { _id: tripId },
+      { $inc: { queueMutationVersion: 1 } },
+      { new: true, session }
+    );
 
     const queueState = await this.getQueueState(tripId, session);
     return {
@@ -325,6 +335,42 @@ class QueueService {
       currentSong,
       queue
     };
+  }
+
+  async getCanonicalTripState(tripId, session = null) {
+    let tripQuery = Trip.findById(tripId);
+    let membersQuery = User.find({ tripId, isActive: true })
+      .select('displayName role songsPlayed joinedAt');
+    if (session) {
+      tripQuery = tripQuery.session(session);
+      membersQuery = membersQuery.session(session);
+    }
+
+    const trip = await tripQuery;
+    if (!trip) return null;
+
+    const queueState = await this.getQueueState(tripId, session);
+    const members = await membersQuery;
+
+    return {
+      version: trip.queueMutationVersion || 0,
+      trip,
+      currentSong: queueState.currentSong,
+      queue: queueState.queue,
+      queueLocked: trip.queueLocked,
+      isPlaying: trip.isPlaying,
+      members,
+      status: trip.status
+    };
+  }
+
+  async commitTripMutation(tripId) {
+    const trip = await Trip.findOneAndUpdate(
+      { _id: tripId },
+      { $inc: { queueMutationVersion: 1 } },
+      { new: true }
+    );
+    return trip ? this.getCanonicalTripState(tripId) : null;
   }
 
   async getUserRequests(tripId, userId) {

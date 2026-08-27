@@ -7,6 +7,7 @@ const User = require('../models/User');
 const Song = require('../models/Song');
 const generateJoinCode = require('../utils/generateJoinCode');
 const QueueService = require('../services/queueService');
+const broadcastTripState = require('../utils/tripState');
 
 const queueService = new QueueService();
 
@@ -76,10 +77,13 @@ router.post('/', async (req, res) => {
 
     await hostUser.save();
 
+    const tripState = await queueService.commitTripMutation(trip._id);
+
     res.status(201).json({
       tripId: trip._id,
       joinCode: trip.joinCode,
       hostUser: hostUser,
+      tripState,
       message: 'Trip created successfully'
     });
   } catch (error) {
@@ -120,6 +124,7 @@ router.post('/join', async (req, res) => {
       return res.status(403).json({ message: 'Cannot join as Host. Host privileges belong to trip creator.' });
     }
 
+    const membershipChanged = !user || !user.isActive;
     if (!user) {
       // Create new passenger user (ALWAYS PASSENGER)
       user = new User({
@@ -135,17 +140,21 @@ router.post('/join', async (req, res) => {
       await user.save();
     }
 
-    // Get queue state
-    const queueState = await queueService.getQueueState(trip._id);
+    const tripState = membershipChanged
+      ? await queueService.commitTripMutation(trip._id)
+      : await queueService.getCanonicalTripState(trip._id);
+    const io = getIO(req);
+    if (io && membershipChanged) broadcastTripState(io, tripState);
 
     res.status(200).json({
       tripId: trip._id,
       user: user,
       trip: trip,
-      currentSong: queueState.currentSong,
-      queue: queueState.queue,
-      totalSongs: queueState.totalSongs,
-      queueLocked: trip.queueLocked,
+      currentSong: tripState.currentSong,
+      queue: tripState.queue,
+      totalSongs: tripState.queue.length,
+      queueLocked: tripState.queueLocked,
+      tripState,
       message: 'Joined trip successfully'
     });
   } catch (error) {
@@ -168,20 +177,14 @@ router.get('/:tripId', async (req, res) => {
       return res.status(404).json({ message: 'Trip not found or has ended' });
     }
 
-    const members = await User.find({
-      tripId: tripId,
-      isActive: true
-    }).select('displayName role songsPlayed joinedAt');
-
-    const queueState = await queueService.getQueueState(tripId);
+    const tripState = await queueService.getCanonicalTripState(tripId);
 
     res.status(200).json({
-      trip,
-      members,
-      currentSong: queueState.currentSong,
-      queue: queueState.queue,
-      totalSongs: queueState.totalSongs,
-      queueLocked: trip.queueLocked
+      ...tripState,
+      members: tripState.members,
+      currentSong: tripState.currentSong,
+      queue: tripState.queue,
+      queueLocked: tripState.queueLocked
     });
   } catch (error) {
     console.error('Get trip error:', error);
@@ -211,9 +214,9 @@ router.get('/:tripId/queue', async (req, res) => {
   try {
     const { tripId } = req.params;
 
-    const queueState = await queueService.getQueueState(tripId);
+    const tripState = await queueService.getCanonicalTripState(tripId);
 
-    res.status(200).json(queueState);
+    res.status(200).json(tripState);
   } catch (error) {
     console.error('Get queue error:', error);
     res.status(500).json({ message: 'Failed to get queue' });
