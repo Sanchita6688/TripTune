@@ -11,7 +11,7 @@ export const useTrip = (tripId) => {
       try {
         setLoading(true)
         const response = await api.get(`/trips/${tripId}`)
-        setTrip(response.data)
+        setTrip(response.data.trip || response.data)
       } catch (error) {
         setError(error.response?.data?.message || 'Failed to fetch trip')
       } finally {

@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const mongoose = require('mongoose');
 const Trip = require('../models/Trip');
@@ -11,19 +12,27 @@ const queueService = new QueueService();
 
 const getIO = (req) => req.app.get('io');
 
+const getUserForSession = async (userId, sessionId) => {
+  if (!userId || !sessionId || !mongoose.Types.ObjectId.isValid(userId)) return null;
+  return User.findOne({ _id: userId, sessionId, isActive: true });
+};
+
 // Create trip
 router.post('/', async (req, res) => {
   try {
     const { name, hostName } = req.body;
     
     // Validate input
-    if (!name || !hostName) {
+    if (typeof name !== 'string' || typeof hostName !== 'string' || !name.trim() || !hostName.trim()) {
       return res.status(400).json({ message: 'Trip name and host name are required' });
     }
 
-    if (name.length > 100 || hostName.length > 50) {
+    if (name.trim().length > 100 || hostName.trim().length > 50) {
       return res.status(400).json({ message: 'Invalid input length' });
     }
+
+    const cleanName = name.trim();
+    const cleanHostName = hostName.trim();
 
     // Generate unique join code
     let joinCode;
@@ -47,10 +56,10 @@ router.post('/', async (req, res) => {
 
     // Create trip
     const trip = new Trip({
-      name,
+      name: cleanName,
       joinCode,
       hostId: hostUserId.toString(),
-      hostName,
+      hostName: cleanHostName,
       status: 'WAITING'
     });
 
@@ -60,9 +69,9 @@ router.post('/', async (req, res) => {
     const hostUser = new User({
       _id: hostUserId,
       tripId: trip._id,
-      displayName: hostName,
+      displayName: cleanHostName,
       role: 'HOST',
-      sessionId: `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      sessionId: crypto.randomBytes(32).toString('hex')
     });
 
     await hostUser.save();
@@ -99,11 +108,12 @@ router.post('/join', async (req, res) => {
       return res.status(404).json({ message: 'Trip not found or has ended' });
     }
 
-    // Check if user already exists
+    const sessionId = typeof req.body.sessionId === 'string' ? req.body.sessionId : null;
+
+    // Only the matching private session may resume an existing passenger.
     let user = await User.findOne({
       tripId: trip._id,
-      displayName: displayName,
-      isActive: true
+      sessionId
     });
 
     if (user && user.role === 'HOST') {
@@ -116,8 +126,12 @@ router.post('/join', async (req, res) => {
         tripId: trip._id,
         displayName: displayName,
         role: 'PASSENGER',
-        sessionId: `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+        sessionId: crypto.randomBytes(32).toString('hex')
       });
+      await user.save();
+    } else {
+      user.isActive = true;
+      user.lastSeenAt = new Date();
       await user.save();
     }
 
@@ -210,11 +224,12 @@ router.get('/:tripId/queue', async (req, res) => {
 router.post('/:tripId/end', async (req, res) => {
   try {
     const { tripId } = req.params;
-    const { userId } = req.body;
+    const { userId, sessionId } = req.body;
 
     // Verify host
-    const user = await User.findById(userId);
-    if (!user || user.role !== 'HOST') {
+    const user = await getUserForSession(userId, sessionId);
+    const trip = await Trip.findById(tripId);
+    if (!user || user.role !== 'HOST' || user.tripId.toString() !== tripId || trip?.hostId !== user._id.toString()) {
       return res.status(403).json({ message: 'Only host can end the trip' });
     }
 

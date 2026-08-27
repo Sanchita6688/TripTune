@@ -25,7 +25,7 @@ const corsOptions = {
     if (!origin || allowedOrigins.includes(origin) || origin.startsWith('http://localhost:')) {
       callback(null, true);
     } else {
-      callback(null, true);
+      callback(new Error('Origin is not allowed by CORS'));
     }
   },
   credentials: true

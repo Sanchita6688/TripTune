@@ -2,6 +2,7 @@ const Song = require('../models/Song');
 const User = require('../models/User');
 const Trip = require('../models/Trip');
 const FairQueue = require('../algorithms/fairQueue');
+const mongoose = require('mongoose');
 
 class QueueService {
   constructor() {
@@ -9,8 +10,60 @@ class QueueService {
   }
 
   async addSong(tripId, userId, videoData) {
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      await session.withTransaction(async () => {
+        result = await this.addSongInTransaction(tripId, userId, videoData, session);
+      });
+      return result;
+    } catch (error) {
+      if (error?.code === 11000) {
+        return this.addDuplicateRequester(tripId, userId, videoData);
+      }
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+  }
+
+  async addDuplicateRequester(tripId, userId, videoData) {
+    const user = await User.findById(userId);
+    const existingSong = await Song.findOne({
+      tripId,
+      providerId: videoData.videoId,
+      status: { $in: ['QUEUED', 'PLAYING'] }
+    });
+
+    if (!user || !existingSong) {
+      throw { status: 409, message: 'Song was added concurrently. Please try again.' };
+    }
+
+    const currentNames = existingSong.userDisplayName ? existingSong.userDisplayName.split(', ') : [];
+    if (!currentNames.includes(user.displayName)) {
+      currentNames.push(user.displayName);
+      await Song.findByIdAndUpdate(existingSong._id, {
+        userDisplayName: currentNames.join(', ')
+      });
+    }
+
+    return {
+      song: await Song.findById(existingSong._id),
+      isDuplicate: true,
+      message: `Song is already in queue! Added ${user.displayName} to requesters.`,
+      queueState: await this.getQueueState(tripId)
+    };
+  }
+
+  async addSongInTransaction(tripId, userId, videoData, session) {
     // 1. Verify trip exists and is active
-    const trip = await Trip.findById(tripId);
+    // Writing the trip document serializes additions for the same trip.
+    const tripLock = await Trip.findOneAndUpdate(
+      { _id: tripId },
+      { $inc: { queueMutationVersion: 1 } },
+      { new: true, session }
+    );
+    const trip = tripLock;
     if (!trip) {
       throw { status: 404, message: 'Trip not found' };
     }
@@ -22,7 +75,11 @@ class QueueService {
     }
 
     // 2. Verify user belongs to trip
-    const user = await User.findById(userId);
+    const user = await User.findOneAndUpdate(
+      { _id: userId, tripId },
+      { $inc: { queueMutationVersion: 1 } },
+      { new: true, session }
+    );
     if (!user || user.tripId.toString() !== tripId.toString()) {
       throw { status: 403, message: 'User does not belong to this trip' };
     }
@@ -33,7 +90,7 @@ class QueueService {
       tripId: tripId,
       userId: userId,
       status: 'QUEUED'
-    });
+    }).session(session);
 
     if (pendingCount >= maxPending) {
       throw {
@@ -47,7 +104,7 @@ class QueueService {
       tripId: tripId,
       providerId: videoData.videoId,
       status: { $in: ['QUEUED', 'PLAYING'] }
-    });
+    }).session(session);
 
     if (existingSong) {
       const currentNames = existingSong.userDisplayName ? existingSong.userDisplayName.split(', ') : [];
@@ -55,10 +112,10 @@ class QueueService {
         currentNames.push(user.displayName);
         await Song.findByIdAndUpdate(existingSong._id, {
           userDisplayName: currentNames.join(', ')
-        });
+        }, { session });
       }
-      const updatedExisting = await Song.findById(existingSong._id);
-      const queueState = await this.getQueueState(tripId);
+      const updatedExisting = await Song.findById(existingSong._id).session(session);
+      const queueState = await this.getQueueState(tripId, session);
       return {
         song: updatedExisting,
         isDuplicate: true,
@@ -83,23 +140,22 @@ class QueueService {
       requestedAt: new Date()
     });
 
-    await newSong.save();
+    await newSong.save({ session });
 
     await User.findByIdAndUpdate(user._id, {
       $inc: { songsRequested: 1 }
-    });
+    }, { session });
 
     // Update queue ordering positions using Round-Robin Fair Queue algorithm
-    await this.updateSongPositions(tripId);
+    await this.updateSongPositions(tripId, session);
 
     // If no song is currently playing in this trip, automatically advance top fair song to PLAYING!
-    const currentPlaying = await Song.findOne({ tripId: tripId, status: 'PLAYING' });
+    const currentPlaying = await Song.findOne({ tripId: tripId, status: 'PLAYING' }).session(session);
     if (!currentPlaying) {
-      await this.getNextSong(tripId);
-      await Trip.findByIdAndUpdate(tripId, { isPlaying: true });
+      await this.getNextSong(tripId, session);
     }
 
-    const queueState = await this.getQueueState(tripId);
+    const queueState = await this.getQueueState(tripId, session);
     return {
       song: newSong,
       isDuplicate: false,
@@ -108,22 +164,26 @@ class QueueService {
     };
   }
 
-  async getNextSong(tripId) {
+  async getNextSong(tripId, session = null) {
     try {
-      const queuedSongs = await Song.find({
+      let queuedQuery = Song.find({
         tripId: tripId,
         status: 'QUEUED'
       }).sort({ requestedAt: 1 });
+      if (session) queuedQuery = queuedQuery.session(session);
+      const queuedSongs = await queuedQuery;
 
       if (queuedSongs.length === 0) {
         return null;
       }
 
       const userIds = [...new Set(queuedSongs.map(s => s.userId.toString()))];
-      const users = await User.find({
+      let usersQuery = User.find({
         _id: { $in: userIds },
         tripId: tripId
       });
+      if (session) usersQuery = usersQuery.session(session);
+      const users = await usersQuery;
 
       const userStats = {};
       users.forEach(u => {
@@ -137,66 +197,91 @@ class QueueService {
       const selectedSong = this.fairQueue.getNextSong(queuedSongs, userStats);
       if (!selectedSong) return null;
 
-      // Mark current PLAYING song as PLAYED
-      await Song.updateMany(
-        { tripId: tripId, status: 'PLAYING' },
-        { status: 'PLAYED', finishedAt: new Date() }
-      );
-
-      // Mark selected song as PLAYING
-      const updatedSong = await Song.findByIdAndUpdate(
-        selectedSong._id,
+      // Claim the next song only while it is still queued. Terminal transitions
+      // are responsible for closing the previous PLAYING song atomically.
+      const playingSong = await Song.findOneAndUpdate(
+        { _id: selectedSong._id, tripId: tripId, status: 'QUEUED' },
         {
           status: 'PLAYING',
           startedAt: new Date()
         },
-        { new: true }
+        { new: true, session }
       );
 
-      // Update requesting user stats
-      if (selectedSong.userId) {
-        await User.findByIdAndUpdate(selectedSong.userId, {
-          $inc: { songsPlayed: 1 },
-          lastPlayedAt: new Date()
-        });
+      if (!playingSong) {
+        let currentQuery = Song.findOne({ tripId: tripId, status: 'PLAYING' });
+        if (session) currentQuery = currentQuery.session(session);
+        return currentQuery;
       }
 
-      // Recalculate positions for remaining queued songs using Round-Robin
-      await this.updateSongPositions(tripId);
+      // Update requesting user stats
+      if (playingSong.userId) {
+        await User.findByIdAndUpdate(playingSong.userId, {
+          $inc: { songsPlayed: 1 },
+          lastPlayedAt: new Date()
+        }, { session });
+      }
 
-      return updatedSong;
+      await Trip.findByIdAndUpdate(tripId, {
+        currentSongId: playingSong._id,
+        isPlaying: true
+      }, { session });
+
+      // Recalculate positions for remaining queued songs using Round-Robin
+      await this.updateSongPositions(tripId, session);
+
+      return playingSong;
     } catch (error) {
       console.error('Error in getNextSong:', error);
       throw error;
     }
   }
 
-  async songEnded(tripId, songId) {
-    if (songId) {
-      await Song.findByIdAndUpdate(songId, {
-        status: 'PLAYED',
-        finishedAt: new Date()
-      });
-    } else {
-      await Song.updateMany(
-        { tripId: tripId, status: 'PLAYING' },
-        { status: 'PLAYED', finishedAt: new Date() }
-      );
+  async transitionCurrentSong(tripId, expectedSongId, terminalStatus) {
+    let songId = expectedSongId;
+    if (!songId) {
+      const currentSong = await Song.findOne({ tripId, status: 'PLAYING' }).select('_id');
+      songId = currentSong?._id;
     }
-    return await this.getNextSong(tripId);
+
+    if (!songId) {
+      return { claimed: false, nextSong: null };
+    }
+
+    const transitionedSong = await Song.findOneAndUpdate(
+      { _id: songId, tripId, status: 'PLAYING' },
+      { status: terminalStatus, finishedAt: new Date() },
+      { new: true }
+    );
+
+    if (!transitionedSong) {
+      return { claimed: false, nextSong: null };
+    }
+
+    const nextSong = await this.getNextSong(tripId);
+    return { claimed: true, transitionedSong, nextSong };
   }
 
-  async updateSongPositions(tripId) {
+  async songEnded(tripId, songId) {
+    const result = await this.transitionCurrentSong(tripId, songId, 'PLAYED');
+    return result.claimed ? result.nextSong : null;
+  }
+
+  async updateSongPositions(tripId, session = null) {
     try {
-      const queuedSongs = await Song.find({
+      let queuedQuery = Song.find({
         tripId: tripId,
         status: 'QUEUED'
       }).sort({ requestedAt: 1 });
+      if (session) queuedQuery = queuedQuery.session(session);
+      const queuedSongs = await queuedQuery;
 
       if (queuedSongs.length === 0) return;
 
       const userIds = [...new Set(queuedSongs.map(s => s.userId.toString()))];
-      const users = await User.find({ _id: { $in: userIds }, tripId });
+      let usersQuery = User.find({ _id: { $in: userIds }, tripId });
+      if (session) usersQuery = usersQuery.session(session);
+      const users = await usersQuery;
       const userStats = {};
       users.forEach(u => {
         userStats[u._id.toString()] = {
@@ -212,23 +297,29 @@ class QueueService {
       for (let i = 0; i < fairOrderedSongs.length; i++) {
         await Song.findByIdAndUpdate(fairOrderedSongs[i]._id, {
           position: i + 1
-        });
+        }, { session });
       }
     } catch (error) {
       console.error('Error updating song positions:', error);
     }
   }
 
-  async getQueueState(tripId) {
-    const currentSong = await Song.findOne({
+  async getQueueState(tripId, session = null) {
+    let currentQuery = Song.findOne({
       tripId: tripId,
       status: 'PLAYING'
     });
-
-    const queue = await Song.find({
+    let queueQuery = Song.find({
       tripId: tripId,
       status: 'QUEUED'
     }).sort({ position: 1 });
+    if (session) {
+      currentQuery = currentQuery.session(session);
+      queueQuery = queueQuery.session(session);
+    }
+
+    const currentSong = await currentQuery;
+    const queue = await queueQuery;
 
     return {
       currentSong,

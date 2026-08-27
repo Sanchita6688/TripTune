@@ -17,8 +17,9 @@ function SearchBar({ onSearch, isSearching }) {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search YouTube for a song or artist..."
+          placeholder="Search for a song, artist, or mood…"
           disabled={isSearching}
+          aria-label="Search YouTube"
           className="w-full px-4 py-3 bg-white border border-[#D8D8D2] rounded text-[#17191B] placeholder-[#72767A] focus:outline-none focus:border-[#2457D6] disabled:opacity-60 transition-colors text-sm"
         />
         {query && !isSearching && (

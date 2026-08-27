@@ -1,14 +1,13 @@
 import { useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
-import { Copy, Check, QrCode, ArrowRight } from 'lucide-react'
+import { Copy, Check, QrCode } from 'lucide-react'
 
-function TicketCard({ trip, joinCode, routeName = 'PICT → GOA', busNo = 'BUS 02' }) {
+function TicketCard({ trip, joinCode }) {
   const [copiedCode, setCopiedCode] = useState(false)
   const [copiedLink, setCopiedLink] = useState(false)
 
   const codeToUse = trip?.joinCode || joinCode || 'GOA247'
-  const tripTitle = trip?.name || 'PICT → GOA'
-  const host = trip?.hostName || 'Host'
+  const tripTitle = trip?.name || 'Your route'
   const joinUrl = `${window.location.origin}?code=${codeToUse}`
 
   const handleCopyCode = () => {
@@ -31,24 +30,23 @@ function TicketCard({ trip, joinCode, routeName = 'PICT → GOA', busNo = 'BUS 0
           <span className="font-mono text-[10px] font-bold text-[#2457D6] uppercase tracking-widest block">
             ROUTE MARKER PASS
           </span>
-          <span className="font-heading font-extrabold text-base text-[#17191B]">
-            JOIN THIS ROUTE
+          <span className="font-heading font-extrabold text-base text-[#17191B] truncate block max-w-[200px]" title={tripTitle}>
+            {tripTitle}
           </span>
         </div>
-        <span className="font-mono text-xs text-[#72767A]">{busNo}</span>
       </div>
 
       {/* Body */}
       <div className="p-5 space-y-4">
         {/* Route Visual Line */}
         <div className="flex items-center justify-between text-xs font-mono font-bold text-[#17191B]">
-          <span>PICT</span>
+          <span>START</span>
           <div className="flex-1 mx-3 flex items-center">
             <div className="w-2 h-2 rounded-full bg-[#2457D6]" />
             <div className="flex-1 h-[2px] bg-[#2457D6]" />
             <div className="w-2 h-2 rounded-full bg-[#2457D6]" />
           </div>
-          <span>GOA</span>
+          <span>DESTINATION</span>
         </div>
 
         {/* QR Code Frame */}

@@ -42,6 +42,10 @@ const tripSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  queueMutationVersion: {
+    type: Number,
+    default: 0
+  },
   createdAt: {
     type: Date,
     default: Date.now

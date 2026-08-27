@@ -5,6 +5,7 @@ function NowPlaying({ currentSong, isHost, isPlaying, onSongEnded, onPlayToggle,
   const [playLocalAudio, setPlayLocalAudio] = useState(isHost)
   const currentVideoId = currentSong?.providerId
   const lastEndedIdRef = useRef(null)
+  const playerRef = useRef(null)
 
   // Keep playLocalAudio synced if host status changes
   useEffect(() => {
@@ -12,6 +13,16 @@ function NowPlaying({ currentSong, isHost, isPlaying, onSongEnded, onPlayToggle,
       setPlayLocalAudio(true)
     }
   }, [isHost])
+
+  // Keep the embedded player aligned with the host's shared playback controls.
+  useEffect(() => {
+    if (!isHost || !playerRef.current || !currentSong) return
+    playerRef.current.contentWindow?.postMessage(JSON.stringify({
+      event: 'command',
+      func: isPlaying ? 'playVideo' : 'pauseVideo',
+      args: []
+    }), '*')
+  }, [currentSong?._id, isHost, isPlaying])
 
   // Listen for YouTube IFrame postMessage events (auto-advance on song end)
   useEffect(() => {
@@ -41,8 +52,8 @@ function NowPlaying({ currentSong, isHost, isPlaying, onSongEnded, onPlayToggle,
     <div className="bg-white/5 border border-[#D8D8D2]/30 rounded-md p-5 space-y-4 shadow-sm font-sans">
       {/* Indicator Bar */}
       <div className="flex items-center justify-between border-b border-[#D8D8D2]/30 pb-3">
-        <span className="font-mono text-xs font-bold text-[#EF6245] tracking-widest uppercase flex items-center gap-2">
-          <span className="w-2.5 h-2.5 rounded-full bg-[#EF6245] animate-pulse" />
+        <span className="font-mono text-xs font-bold text-[#F6BC55] tracking-widest uppercase flex items-center gap-2">
+          <span className="w-2.5 h-2.5 rounded-full bg-[#F6BC55] animate-pulse" />
           CURRENT STOP
         </span>
 
@@ -70,8 +81,9 @@ function NowPlaying({ currentSong, isHost, isPlaying, onSongEnded, onPlayToggle,
             <div className="space-y-3">
               <div className="w-full aspect-video rounded overflow-hidden bg-black border border-[#D8D8D2]/30 relative shadow-md">
                 <iframe
+                  ref={playerRef}
                   key={currentVideoId}
-                  src={`https://www.youtube.com/embed/${currentVideoId}?autoplay=1&enablejsapi=1&controls=1&rel=0`}
+                  src={`https://www.youtube.com/embed/${currentVideoId}?autoplay=1&enablejsapi=1&controls=1&rel=0&origin=${encodeURIComponent(window.location.origin)}`}
                   title={currentSong.title || 'YouTube Player'}
                   className="w-full h-full border-0"
                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"

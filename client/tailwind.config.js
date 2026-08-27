@@ -7,32 +7,32 @@ export default {
   theme: {
     extend: {
       colors: {
-        'map-bg': '#F7F5EF',
+        'map-bg': '#F4F6FF',
         charcoal: {
-          DEFAULT: '#17191B',
-          light: '#2D3135'
+          DEFAULT: '#172044',
+          light: '#2A3560'
         },
         cobalt: {
-          DEFAULT: '#2457D6',
-          hover: '#1D46B0',
-          light: '#EBF0FC'
+          DEFAULT: '#6258ED',
+          hover: '#5147DB',
+          light: '#EEEDFF'
         },
         green: {
-          fresh: '#48A868'
+          fresh: '#55DFBD'
         },
         vermillion: {
-          DEFAULT: '#EF6245',
-          light: '#FDECE8'
+          DEFAULT: '#FF7397',
+          light: '#FFF0F4'
         },
         muted: {
-          DEFAULT: '#72767A',
-          border: '#D8D8D2'
+          DEFAULT: '#64709A',
+          border: '#DBE1F5'
         }
       },
       fontFamily: {
-        sans: ['Manrope', 'sans-serif'],
-        heading: ['Manrope', 'sans-serif'],
-        mono: ['IBM Plex Mono', 'monospace']
+        sans: ['Space Grotesk', 'Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        heading: ['Space Grotesk', 'Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        mono: ['DM Mono', 'ui-monospace', 'SFMono-Regular', 'monospace']
       },
       borderRadius: {
         'sm': '4px',

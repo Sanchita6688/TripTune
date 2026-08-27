@@ -54,6 +54,7 @@ function QueueItem({ song, position, currentUserId, isHost, onRemoveSong }) {
         <button
           onClick={() => onRemoveSong(song._id)}
           title="Remove from queue"
+          aria-label={`Remove ${song.title} from queue`}
           className="opacity-60 group-hover:opacity-100 p-1.5 text-[#72767A] hover:text-[#EF6245] transition-colors"
         >
           <Trash2 className="w-3.5 h-3.5" />

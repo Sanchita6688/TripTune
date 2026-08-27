@@ -10,6 +10,11 @@ const queueService = new QueueService();
 
 const getIO = (req) => req.app.get('io');
 
+const getUserForSession = async (userId, sessionId) => {
+  if (!userId || !sessionId || !mongoose.Types.ObjectId.isValid(userId)) return null;
+  return User.findOne({ _id: userId, sessionId, isActive: true });
+};
+
 // Robust helper to extract tripId from req.params, req.body, or URL path
 const getTripId = (req) => {
   if (req.params.tripId && mongoose.Types.ObjectId.isValid(req.params.tripId)) {
@@ -26,7 +31,7 @@ const getTripId = (req) => {
 router.post(['/', '/:tripId'], async (req, res) => {
   try {
     const tripId = getTripId(req);
-    const { userId, provider, providerId, title, artistOrChannel, thumbnail, duration } = req.body;
+    const { userId, sessionId, provider, providerId, title, artistOrChannel, thumbnail, duration } = req.body;
 
     if (!tripId || !mongoose.Types.ObjectId.isValid(tripId)) {
       return res.status(400).json({ success: false, message: 'Invalid or missing Trip ID' });
@@ -39,6 +44,10 @@ router.post(['/', '/:tripId'], async (req, res) => {
     const videoId = providerId || req.body.videoId;
     if (!videoId) {
       return res.status(400).json({ success: false, message: 'Missing song providerId/videoId' });
+    }
+
+    if (!await getUserForSession(userId, sessionId)) {
+      return res.status(403).json({ success: false, message: 'Invalid user session' });
     }
 
     const videoData = {
@@ -59,6 +68,10 @@ router.post(['/', '/:tripId'], async (req, res) => {
         song: result.song,
         isDuplicate: result.isDuplicate,
         queueState: result.queueState
+      });
+      io.to(`trip:${tripId}`).emit('playbackStateChanged', {
+        isPlaying: Boolean(result.queueState.currentSong),
+        currentSong: result.queueState.currentSong
       });
     }
 
@@ -101,8 +114,9 @@ router.get(['/my-requests', '/:tripId/my-requests'], async (req, res) => {
   try {
     const tripId = getTripId(req);
     const userId = req.query.userId;
+    const sessionId = req.query.sessionId;
 
-    if (!tripId || !userId) {
+    if (!tripId || !userId || !sessionId || !await getUserForSession(userId, sessionId)) {
       return res.status(400).json({ success: false, message: 'tripId and userId are required' });
     }
 
@@ -123,13 +137,14 @@ router.delete(['/:songId', '/:tripId/:songId'], async (req, res) => {
     const tripId = getTripId(req);
     const songId = req.params.songId;
     const userId = req.body.userId || req.query.userId;
+    const sessionId = req.body.sessionId || req.query.sessionId;
 
     if (!songId || !mongoose.Types.ObjectId.isValid(songId)) {
       return res.status(400).json({ success: false, message: 'Invalid Song ID' });
     }
 
-    const user = await User.findById(userId);
-    if (!user) {
+    const user = await getUserForSession(userId, sessionId);
+    if (!user || user.tripId.toString() !== tripId) {
       return res.status(403).json({ success: false, message: 'User not found' });
     }
 
@@ -138,7 +153,7 @@ router.delete(['/:songId', '/:tripId/:songId'], async (req, res) => {
       return res.status(404).json({ success: false, message: 'Song not found' });
     }
 
-    if (user.role !== 'HOST' && song.userId.toString() !== userId.toString()) {
+    if (song.tripId.toString() !== tripId || (user.role !== 'HOST' && song.userId.toString() !== userId.toString())) {
       return res.status(403).json({ success: false, message: 'Not authorized to remove this song' });
     }
 
@@ -170,13 +185,25 @@ router.post(['/skip', '/:tripId/skip'], async (req, res) => {
   try {
     const tripId = getTripId(req);
     const userId = req.body.userId;
+    const sessionId = req.body.sessionId;
 
-    const user = await User.findById(userId);
-    if (!user || user.role !== 'HOST') {
+    const user = await getUserForSession(userId, sessionId);
+    if (!user || user.role !== 'HOST' || user.tripId.toString() !== tripId) {
       return res.status(403).json({ success: false, message: 'Only the host can skip songs' });
     }
 
-    const nextSong = await queueService.songEnded(tripId, null);
+    const currentSong = await Song.findOne({ tripId, status: 'PLAYING' }).select('_id');
+    const transition = await queueService.transitionCurrentSong(tripId, currentSong?._id, 'SKIPPED');
+    if (!transition.claimed) {
+      const queueState = await queueService.getQueueState(tripId);
+      return res.status(200).json({
+        success: true,
+        alreadyHandled: true,
+        message: 'The current song was already handled',
+        data: { currentSong: queueState.currentSong, queueState }
+      });
+    }
+    const nextSong = transition.nextSong;
     const queueState = await queueService.getQueueState(tripId);
 
     await Trip.findByIdAndUpdate(tripId, {
@@ -206,8 +233,25 @@ router.post(['/ended', '/:tripId/ended'], async (req, res) => {
   try {
     const tripId = getTripId(req);
     const songId = req.body.songId;
+    const userId = req.body.userId;
+    const sessionId = req.body.sessionId;
 
-    const nextSong = await queueService.songEnded(tripId, songId);
+    const user = await getUserForSession(userId, sessionId);
+    if (!user || user.role !== 'HOST' || user.tripId.toString() !== tripId) {
+      return res.status(403).json({ success: false, message: 'Only the host can advance songs' });
+    }
+
+    const transition = await queueService.transitionCurrentSong(tripId, songId, 'PLAYED');
+    if (!transition.claimed) {
+      const queueState = await queueService.getQueueState(tripId);
+      return res.status(200).json({
+        success: true,
+        alreadyHandled: true,
+        message: 'That song was already handled',
+        data: { currentSong: queueState.currentSong, queueState }
+      });
+    }
+    const nextSong = transition.nextSong;
     const queueState = await queueService.getQueueState(tripId);
 
     await Trip.findByIdAndUpdate(tripId, {
@@ -218,6 +262,10 @@ router.post(['/ended', '/:tripId/ended'], async (req, res) => {
     const io = getIO(req);
     if (io) {
       io.to(`trip:${tripId}`).emit('queueUpdated', queueState);
+      io.to(`trip:${tripId}`).emit('playbackStateChanged', {
+        isPlaying: Boolean(nextSong),
+        currentSong: nextSong
+      });
     }
 
     return res.status(200).json({

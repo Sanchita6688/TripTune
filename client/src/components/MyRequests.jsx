@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { getUserRequests } from '../services/youtube'
 import { RotateCw } from 'lucide-react'
 
-function MyRequests({ tripId, userId, queue = [] }) {
+function MyRequests({ tripId, userId, sessionId, queue = [] }) {
   const [requests, setRequests] = useState([])
   const [loading, setLoading] = useState(false)
 
@@ -10,7 +10,7 @@ function MyRequests({ tripId, userId, queue = [] }) {
     if (!tripId || !userId) return
     setLoading(true)
     try {
-      const data = await getUserRequests(tripId, userId)
+      const data = await getUserRequests(tripId, userId, sessionId)
       setRequests(Array.isArray(data) ? data : [])
     } catch (err) {
       console.error('Fetch my requests error:', err)
@@ -22,7 +22,7 @@ function MyRequests({ tripId, userId, queue = [] }) {
 
   useEffect(() => {
     fetchMyRequests()
-  }, [tripId, userId, queue])
+  }, [tripId, userId, sessionId, queue])
 
   const safeQueue = Array.isArray(queue) ? queue : []
   const safeRequests = Array.isArray(requests) ? requests : []

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import api from './services/api'
 import { getSocket } from './services/socket'
 import { addSongToQueue, removeSongFromQueue, skipCurrentSong, notifySongEnded } from './services/youtube'
@@ -18,18 +18,17 @@ function App() {
   // Theme State: 'dark' or 'light'
   const [theme, setTheme] = useState(() => {
     try {
-      return localStorage.getItem('triptune_theme') || 'dark'
+      return localStorage.getItem('triptune_theme') === 'light' ? 'light' : 'dark'
     } catch (e) {
       return 'dark'
     }
   })
 
-  useEffect(() => {
-    if (theme === 'light') {
-      document.body.classList.add('theme-light')
-    } else {
-      document.body.classList.remove('theme-light')
-    }
+  useLayoutEffect(() => {
+    const isLight = theme === 'light'
+    document.documentElement.dataset.theme = theme
+    document.documentElement.style.colorScheme = theme
+    document.body.classList.toggle('theme-light', isLight)
     try {
       localStorage.setItem('triptune_theme', theme)
     } catch (e) {}
@@ -73,6 +72,7 @@ function App() {
   const [actionError, setActionError] = useState(null)
   const [actionLoading, setActionLoading] = useState(false)
   const [notification, setNotification] = useState(null)
+  const socketStateReceivedRef = useRef(false)
 
   // Helper session savers
   const saveTripSession = (trip) => {
@@ -123,11 +123,13 @@ function App() {
     try {
       const res = await api.get(`/trips/${tripId}`)
       if (res.data) {
+        if (socketStateReceivedRef.current) return
         if (res.data.trip) saveTripSession(res.data.trip)
         if (res.data.currentSong !== undefined) setCurrentSong(res.data.currentSong)
         if (res.data.queue) setQueue(res.data.queue)
         if (res.data.members) setMembers(res.data.members)
         if (res.data.queueLocked !== undefined) setQueueLocked(res.data.queueLocked)
+        if (res.data.trip?.isPlaying !== undefined) setIsPlaying(res.data.trip.isPlaying)
       }
     } catch (err) {
       console.error('Fetch trip details error:', err)
@@ -148,6 +150,7 @@ function App() {
     if (mode !== 'trip' || !activeTrip?._id || !currentUser?._id) return
 
     const socket = getSocket()
+    socketStateReceivedRef.current = false
 
     const joinRoom = () => {
       socket.emit('joinTrip', {
@@ -157,68 +160,82 @@ function App() {
       })
     }
 
-    if (socket.connected) {
-      joinRoom()
-    } else {
-      socket.on('connect', joinRoom)
-    }
+    socket.on('connect', joinRoom)
 
-    socket.on('tripState', (state) => {
+    if (socket.connected) joinRoom()
+
+    const handleTripState = (state) => {
+      socketStateReceivedRef.current = true
       if (state.trip) saveTripSession(state.trip)
       if (state.currentSong !== undefined) setCurrentSong(state.currentSong)
       if (state.queue) setQueue(state.queue)
       if (state.members) setMembers(state.members)
       if (state.queueLocked !== undefined) setQueueLocked(state.queueLocked)
       if (state.isPlaying !== undefined) setIsPlaying(state.isPlaying)
-    })
+    }
 
-    socket.on('queueUpdated', (state) => {
+    const handleQueueUpdated = (state) => {
       if (state.currentSong !== undefined) setCurrentSong(state.currentSong)
       if (state.queue) setQueue(state.queue)
-    })
+    }
 
-    socket.on('playbackStateChanged', (data) => {
+    const handlePlaybackStateChanged = (data) => {
       if (data.isPlaying !== undefined) setIsPlaying(data.isPlaying)
       if (data.currentSong !== undefined) setCurrentSong(data.currentSong)
-    })
+    }
 
-    socket.on('queueLocked', (data) => {
+    const handleQueueLocked = (data) => {
       if (data.queueLocked !== undefined) setQueueLocked(data.queueLocked)
-    })
+    }
 
-    socket.on('songAdded', (data) => {
+    const handleSongAdded = (data) => {
       if (data.message) showNotification(data.message)
-    })
+    }
 
-    socket.on('memberJoined', (data) => {
+    const handleMemberJoined = (data) => {
       if (data.members) setMembers(data.members)
       if (data.displayName) showNotification(`RIDER ${data.displayName.toUpperCase()} BOARDED THE BUS`)
-    })
+    }
 
-    socket.on('tripEnded', () => {
+    const handleMemberLeft = (data) => {
+      if (data.members) setMembers(data.members)
+    }
+
+    const handleTripEnded = () => {
       showNotification('ROUTE ENDED BY HOST')
       setTimeout(() => {
         handleLeaveTrip()
       }, 2000)
-    })
+    }
 
-    socket.on('error', (err) => {
+    const handleSocketError = (err) => {
       if (err.message) showNotification(`⚠️ ${err.message}`)
       if (err.message && (err.message.includes('not found') || err.message.includes('ended'))) {
         clearSessionAndGoHome('Trip expired or not found.')
       }
-    })
+    }
+
+    socket.on('tripState', handleTripState)
+    socket.on('queueUpdated', handleQueueUpdated)
+    socket.on('playbackStateChanged', handlePlaybackStateChanged)
+    socket.on('queueLocked', handleQueueLocked)
+    socket.on('songAdded', handleSongAdded)
+    socket.on('memberJoined', handleMemberJoined)
+    socket.on('memberLeft', handleMemberLeft)
+    socket.on('tripEnded', handleTripEnded)
+    socket.on('error', handleSocketError)
 
     return () => {
       socket.off('connect', joinRoom)
-      socket.off('tripState')
-      socket.off('queueUpdated')
-      socket.off('playbackStateChanged')
-      socket.off('queueLocked')
-      socket.off('songAdded')
-      socket.off('memberJoined')
-      socket.off('tripEnded')
-      socket.off('error')
+      socket.off('tripState', handleTripState)
+      socket.off('queueUpdated', handleQueueUpdated)
+      socket.off('playbackStateChanged', handlePlaybackStateChanged)
+      socket.off('queueLocked', handleQueueLocked)
+      socket.off('songAdded', handleSongAdded)
+      socket.off('memberJoined', handleMemberJoined)
+      socket.off('memberLeft', handleMemberLeft)
+      socket.off('tripEnded', handleTripEnded)
+      socket.off('error', handleSocketError)
     }
   }, [mode, activeTrip?._id, currentUser?._id])
 
@@ -257,6 +274,7 @@ function App() {
       saveUserSession(res.data.user)
       if (res.data.currentSong !== undefined) setCurrentSong(res.data.currentSong)
       if (res.data.queue) setQueue(res.data.queue)
+      if (res.data.queueLocked !== undefined) setQueueLocked(res.data.queueLocked)
       setMode('trip')
     } catch (err) {
       setActionError(err.response?.data?.message || 'Invalid join code or failed to board')
@@ -267,16 +285,24 @@ function App() {
 
   const handleAddSong = async (songData) => {
     if (!activeTrip?._id || !currentUser?._id) return
-
-    const res = await addSongToQueue(activeTrip._id, currentUser._id, songData)
-    if (res?.message) {
-      showNotification(res.message)
+    try {
+      const res = await addSongToQueue(activeTrip._id, currentUser._id, currentUser.sessionId, songData)
+      if (res?.message) showNotification(res.message)
+    } catch (err) {
+      const message = err.response?.data?.message || 'Could not add that song. Please try again.'
+      showNotification(message)
+      throw new Error(message)
     }
   }
 
   const handleRemoveSong = async (songId) => {
     if (!activeTrip?._id || !currentUser?._id) return
-    await removeSongFromQueue(activeTrip._id, songId, currentUser._id)
+    try {
+      await removeSongFromQueue(activeTrip._id, songId, currentUser._id, currentUser.sessionId)
+      showNotification('Song removed from the queue.')
+    } catch (err) {
+      showNotification(err.response?.data?.message || 'Could not remove that song.')
+    }
   }
 
   const handlePlayToggle = () => {
@@ -288,12 +314,16 @@ function App() {
 
   const handleSkip = async () => {
     if (!activeTrip?._id || !currentUser?._id) return
-    await skipCurrentSong(activeTrip._id, currentUser._id)
+    await skipCurrentSong(activeTrip._id, currentUser._id, currentUser.sessionId)
   }
 
   const handleSongEnded = async (songId) => {
-    if (!activeTrip?._id) return
-    await notifySongEnded(activeTrip._id, songId)
+    if (!activeTrip?._id || !currentUser?._id || !isHost) return
+    try {
+      await notifySongEnded(activeTrip._id, songId, currentUser._id, currentUser.sessionId)
+    } catch (err) {
+      showNotification('Could not advance the queue. Please try again.')
+    }
   }
 
   const handleLockToggle = () => {
@@ -338,6 +368,7 @@ function App() {
           {/* Dark / Light Theme Toggle Button */}
           <button
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
             className="px-3 py-1 bg-[#2457D6]/10 hover:bg-[#2457D6]/20 text-[#2457D6] font-mono text-[11px] font-bold rounded border border-[#2457D6]/30 flex items-center gap-1.5 transition-colors"
           >
             {theme === 'dark' ? (
@@ -346,7 +377,7 @@ function App() {
               </>
             ) : (
               <>
-                <Moon className="w-3.5 h-3.5" /> BLACK THEME
+                <Moon className="w-3.5 h-3.5" /> DARK MODE
               </>
             )}
           </button>
@@ -413,7 +444,7 @@ function App() {
                 <div className="py-6 my-2 bg-white/5 border border-[#D8D8D2]/30 rounded-md p-6 font-mono text-xs font-bold">
                   <div className="flex items-center justify-between max-w-md mx-auto">
                     <div className="flex flex-col items-center">
-                      <span className="text-[#2457D6] mb-1">PICT</span>
+                      <span className="text-[#2457D6] mb-1">START</span>
                       <div className="w-3 h-3 rounded-full bg-[#2457D6]" />
                     </div>
 
@@ -424,7 +455,7 @@ function App() {
                     </div>
 
                     <div className="flex flex-col items-center">
-                      <span className="text-[#2457D6] mb-1">GOA</span>
+                      <span className="text-[#2457D6] mb-1">DESTINATION</span>
                       <div className="w-3 h-3 rounded-full bg-[#2457D6]" />
                     </div>
                   </div>
@@ -587,7 +618,7 @@ function App() {
             <div className="bg-white/5 border border-[#D8D8D2]/30 rounded-md p-5 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 shadow-sm">
               <div>
                 <h1 className="font-heading font-extrabold text-2xl sm:text-3xl uppercase tracking-wide flex items-center gap-2">
-                  <span>{activeTrip.name || 'PICT → GOA'}</span>
+                  <span>{activeTrip.name || 'YOUR ROUTE'}</span>
                 </h1>
                 <div className="font-mono text-xs opacity-75 mt-1 flex items-center gap-3">
                   <span>HOST: {activeTrip.hostName || 'Host'}</span>
@@ -680,20 +711,23 @@ function App() {
                 <MyRequests
                   tripId={activeTrip._id}
                   userId={currentUser?._id}
+                  sessionId={currentUser?.sessionId}
                   queue={queue}
                 />
               </div>
             </div>
 
-            {/* Leave Trip Option */}
-            <div className="pt-4 border-t border-[#D8D8D2]/30 text-center">
-              <button
-                onClick={handleLeaveTrip}
-                className="font-mono text-xs opacity-70 hover:text-[#EF6245] flex items-center gap-1.5 mx-auto uppercase tracking-wider transition-colors"
-              >
-                <LogOut className="w-3.5 h-3.5" /> LEAVE THE ROUTE
-              </button>
-            </div>
+            {/* Passengers can leave without affecting the shared route. Hosts end it from Host controls. */}
+            {!isHost && (
+              <div className="pt-4 border-t border-[#D8D8D2]/30 text-center">
+                <button
+                  onClick={handleLeaveTrip}
+                  className="font-mono text-xs opacity-70 hover:text-[#EF6245] flex items-center gap-1.5 mx-auto uppercase tracking-wider transition-colors"
+                >
+                  <LogOut className="w-3.5 h-3.5" /> LEAVE THE ROUTE
+                </button>
+              </div>
+            )}
           </div>
         )}
       </main>

@@ -10,6 +10,16 @@ class TripSocketHandler {
     this.queueService = new QueueService();
   }
 
+  async getTripUser(tripId, userId, requireHost = false) {
+    if (!mongoose.Types.ObjectId.isValid(tripId) || !mongoose.Types.ObjectId.isValid(userId)) {
+      return null;
+    }
+    const user = await User.findById(userId);
+    if (!user || !user.isActive || user.tripId.toString() !== tripId.toString()) return null;
+    if (requireHost && user.role !== 'HOST') return null;
+    return user;
+  }
+
   handleConnection(socket) {
     console.log(`Socket connected: ${socket.id}`);
 
@@ -24,15 +34,23 @@ class TripSocketHandler {
         }
 
         let user = null;
-        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-          user = await User.findById(userId);
-        }
-        if (!user && sessionId) {
-          user = await User.findOne({ tripId, sessionId });
+        if (userId && sessionId && mongoose.Types.ObjectId.isValid(userId)) {
+          user = await User.findOne({ _id: userId, tripId, sessionId, isActive: true });
         }
 
         if (!user) {
           socket.emit('error', { message: 'User not found for this trip' });
+          return;
+        }
+        if (user.tripId.toString() !== tripId) {
+          socket.emit('error', { message: 'User does not belong to this trip' });
+          return;
+        }
+
+        // Validate the trip before changing membership or joining its room.
+        const trip = await Trip.findById(tripId);
+        if (!trip || trip.status === 'ENDED' || (trip.expiresAt && trip.expiresAt <= new Date())) {
+          socket.emit('error', { message: 'Trip not found or has ended' });
           return;
         }
 
@@ -47,14 +65,11 @@ class TripSocketHandler {
         // Store socket metadata
         socket.data.tripId = tripId;
         socket.data.userId = user._id.toString();
+        socket.data.sessionId = user.sessionId;
         socket.data.roomName = roomName;
 
-        // Fetch latest state
-        const trip = await Trip.findById(tripId);
-        if (!trip) {
-          socket.emit('error', { message: 'Trip not found or has ended' });
-          return;
-        }
+        user.isActive = true;
+        await user.save();
 
         const queueState = await this.queueService.getQueueState(tripId);
         const members = await User.find({ tripId, isActive: true }).select('displayName role songsPlayed joinedAt');
@@ -91,7 +106,7 @@ class TripSocketHandler {
         const { tripId, userId, videoData } = data || {};
         const roomName = `trip:${tripId}`;
 
-        if (!tripId || !userId || !videoData || !videoData.videoId) {
+        if (!tripId || !userId || !videoData || !videoData.videoId || socket.data.userId !== userId || socket.data.tripId !== tripId) {
           socket.emit('error', { message: 'Invalid song parameters' });
           return;
         }
@@ -104,6 +119,10 @@ class TripSocketHandler {
           song: result.song,
           isDuplicate: result.isDuplicate,
           message: result.message
+        });
+        this.io.to(roomName).emit('playbackStateChanged', {
+          isPlaying: Boolean(result.queueState.currentSong),
+          currentSong: result.queueState.currentSong
         });
 
       } catch (error) {
@@ -118,13 +137,16 @@ class TripSocketHandler {
         const { tripId, userId } = data || {};
         const roomName = `trip:${tripId}`;
 
-        const user = await User.findById(userId);
-        if (!user || user.role !== 'HOST') {
+        const user = await this.getTripUser(tripId, userId, true);
+        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
           socket.emit('error', { message: 'Only the host can skip songs' });
           return;
         }
 
-        const nextSong = await this.queueService.songEnded(tripId, null);
+        const currentSong = await Song.findOne({ tripId, status: 'PLAYING' }).select('_id');
+        const transition = await this.queueService.transitionCurrentSong(tripId, currentSong?._id, 'SKIPPED');
+        if (!transition.claimed) return;
+        const nextSong = transition.nextSong;
         const queueState = await this.queueService.getQueueState(tripId);
 
         await Trip.findByIdAndUpdate(tripId, {
@@ -144,10 +166,18 @@ class TripSocketHandler {
     // Song ended naturally (from player)
     socket.on('songEnded', async (data) => {
       try {
-        const { tripId, songId } = data || {};
+        const { tripId, songId, userId } = data || {};
         const roomName = `trip:${tripId}`;
 
-        const nextSong = await this.queueService.songEnded(tripId, songId);
+        const user = await this.getTripUser(tripId, userId, true);
+        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
+          socket.emit('error', { message: 'Only the host can advance songs' });
+          return;
+        }
+
+        const transition = await this.queueService.transitionCurrentSong(tripId, songId, 'PLAYED');
+        if (!transition.claimed) return;
+        const nextSong = transition.nextSong;
         const queueState = await this.queueService.getQueueState(tripId);
 
         await Trip.findByIdAndUpdate(tripId, {
@@ -169,8 +199,8 @@ class TripSocketHandler {
         const { tripId, userId } = data || {};
         const roomName = `trip:${tripId}`;
 
-        const user = await User.findById(userId);
-        if (!user || user.role !== 'HOST') {
+        const user = await this.getTripUser(tripId, userId, true);
+        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
           socket.emit('error', { message: 'Only host can control playback' });
           return;
         }
@@ -190,8 +220,8 @@ class TripSocketHandler {
         const { tripId, userId } = data || {};
         const roomName = `trip:${tripId}`;
 
-        const user = await User.findById(userId);
-        if (!user || user.role !== 'HOST') {
+        const user = await this.getTripUser(tripId, userId, true);
+        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
           socket.emit('error', { message: 'Only host can control playback' });
           return;
         }
@@ -211,8 +241,8 @@ class TripSocketHandler {
         const { tripId, userId } = data || {};
         const roomName = `trip:${tripId}`;
 
-        const user = await User.findById(userId);
-        if (!user || user.role !== 'HOST') {
+        const user = await this.getTripUser(tripId, userId, true);
+        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
           socket.emit('error', { message: 'Only host can lock/unlock queue' });
           return;
         }
@@ -234,8 +264,8 @@ class TripSocketHandler {
         const { tripId, userId } = data || {};
         const roomName = `trip:${tripId}`;
 
-        const user = await User.findById(userId);
-        if (!user || user.role !== 'HOST') {
+        const user = await this.getTripUser(tripId, userId, true);
+        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) {
           socket.emit('error', { message: 'Only host can end the trip' });
           return;
         }
@@ -259,10 +289,10 @@ class TripSocketHandler {
         const { tripId, songId, userId } = data || {};
         const roomName = `trip:${tripId}`;
 
-        const user = await User.findById(userId);
-        const song = await Song.findById(songId);
+        const user = await this.getTripUser(tripId, userId);
+        const song = await Song.findOne({ _id: songId, tripId });
 
-        if (!user || !song) {
+        if (!user || !song || socket.data.userId !== userId || socket.data.tripId !== tripId) {
           socket.emit('error', { message: 'Song or user not found' });
           return;
         }
@@ -282,6 +312,25 @@ class TripSocketHandler {
 
       } catch (error) {
         console.error('removeSong socket error:', error);
+      }
+    });
+
+    socket.on('leaveTrip', async (data) => {
+      try {
+        const { tripId, userId } = data || {};
+        const user = await this.getTripUser(tripId, userId);
+        if (!user || socket.data.userId !== userId || socket.data.tripId !== tripId) return;
+
+        user.isActive = false;
+        user.socketId = null;
+        user.lastSeenAt = new Date();
+        await user.save();
+        socket.leave(`trip:${tripId}`);
+
+        const members = await User.find({ tripId, isActive: true }).select('displayName role songsPlayed joinedAt');
+        this.io.to(`trip:${tripId}`).emit('memberLeft', { userId, members });
+      } catch (error) {
+        console.error('leaveTrip socket error:', error);
       }
     });
 
